@@ -1,0 +1,822 @@
+#!/usr/bin/env bash
+# monorepo-import — absorb GitHub repos into a pnpm workspace monorepo
+# Spec: docs/rfc/rfc-monorepo-migration.md
+set -euo pipefail
+
+# ── Bash version ──────────────────────────────────────────────────────────────
+if (( BASH_VERSINFO[0] < 4 )); then
+  echo "error: bash 4+ required (found ${BASH_VERSION}). On macOS: brew install bash" >&2
+  exit 1
+fi
+
+# ── Locate vendored git-filter-repo ──────────────────────────────────────────
+_SELF="$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$_SELF")"
+VENDOR_FILTER_REPO="$SCRIPT_DIR/scripts/vendor/git-filter-repo"
+declare -a FILTER_REPO_CMD=()
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+OPT_MONOREPO="./monorepo"
+OPT_APP_DIR="apps"
+OPT_PKG_DIR="packages"
+OPT_PKG=false
+OPT_NAME=""
+OPT_BRANCH=""
+OPT_ASDF=false
+OPT_EXTRACT_CONFIGS=false
+OPT_DRY_RUN=false
+OPT_NO_INSTALL=false
+REPOS=()
+IMPORTED_DIRS=()
+declare -A EXTRACTABLE_CONFIGS=()
+
+# ── Colour logging ────────────────────────────────────────────────────────────
+BOLD='\033[1m'; RESET='\033[0m'
+BLUE='\033[0;34m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+RED='\033[0;31m'; GREY='\033[0;90m'
+
+log_info()   { printf "${BLUE}[info]${RESET}  %s\n"     "$*"; }
+log_ok()     { printf "${GREEN}[ok]${RESET}    %s\n"    "$*"; }
+log_warn()   { printf "${YELLOW}[warn]${RESET}  %s\n"   "$*"; }
+log_step()   { printf "\n${BOLD}==> %s${RESET}\n"       "$*"; }
+log_dry()    { printf "${GREY}[dry-run]${RESET} %s\n"   "$*"; }
+die()        { printf "${RED}[error]${RESET} %s\n" "$*" >&2; exit 1; }
+
+# run: skip execution and log in --dry-run mode
+run() {
+  if [[ "$OPT_DRY_RUN" == true ]]; then
+    log_dry "$*"; return 0
+  fi
+  "$@"
+}
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+usage() { cat <<'EOF'
+Usage:
+  monorepo-import [options] <repo> [<repo>...]
+
+Arguments:
+  <repo>       GitHub repo as <owner>/<name> or full URL.
+
+Options:
+  --monorepo <path>    Target directory. Default: ./monorepo
+  --app-dir <dir>      Dir for applications inside monorepo. Default: apps
+  --pkg-dir <dir>      Dir for shared packages inside monorepo. Default: packages
+  --pkg                Place repo under --pkg-dir instead of --app-dir.
+  --name <name>        Override directory name (single repo only).
+  --branch <branch>    Source branch. Default: repo default branch.
+  --asdf               Write .tool-versions; manage Node/pnpm via asdf.
+  --extract-configs    Extract identical configs into shared packages/.
+  --dry-run            Print actions without executing.
+  --no-install         Skip pnpm install.
+  --help
+EOF
+}
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+parse_args() {
+  (( $# )) || { usage; exit 1; }
+  while (( $# )); do
+    case "$1" in
+      --monorepo)        OPT_MONOREPO="$2";      shift 2 ;;
+      --app-dir)         OPT_APP_DIR="$2";        shift 2 ;;
+      --pkg-dir)         OPT_PKG_DIR="$2";        shift 2 ;;
+      --pkg)             OPT_PKG=true;             shift   ;;
+      --name)            OPT_NAME="$2";            shift 2 ;;
+      --branch)          OPT_BRANCH="$2";          shift 2 ;;
+      --asdf)            OPT_ASDF=true;            shift   ;;
+      --extract-configs) OPT_EXTRACT_CONFIGS=true; shift   ;;
+      --dry-run)         OPT_DRY_RUN=true;         shift   ;;
+      --no-install)      OPT_NO_INSTALL=true;      shift   ;;
+      --help|-h)         usage; exit 0 ;;
+      --*)               die "Unknown option: $1" ;;
+      *)                 REPOS+=("$1");             shift   ;;
+    esac
+  done
+  (( ${#REPOS[@]} ))       || { usage; die "No repositories specified."; }
+  if [[ -n "$OPT_NAME" ]] && (( ${#REPOS[@]} > 1 )); then
+    die "--name requires exactly one repository."
+  fi
+}
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+require_cmd() {
+  local cmd="$1" hint="${2:-}"
+  command -v "$cmd" &>/dev/null || die "${cmd} not found.${hint:+ $hint}"
+}
+
+# semver: is $1 >= $2? (compares up to 3 dot-separated numeric segments)
+version_gte() {
+  python3 -c "
+a=tuple(int(x) for x in '$1'.lstrip('v').split('.')[:3])
+b=tuple(int(x) for x in '$2'.lstrip('v').split('.')[:3])
+exit(0 if a>=b else 1)
+"
+}
+
+repo_owner()  { local r="${1#https://github.com/}"; echo "${r%%/*}"; }
+repo_name()   { local r="${1#https://github.com/}"; r="${r##*/}"; echo "${r%.git}"; }
+derive_scope() { echo "@$(repo_owner "$1")"; }
+
+# Highest of two dot-separated version strings
+max_version() {
+  python3 -c "
+a=tuple(int(x) for x in '$1'.lstrip('v').split('.')[:3])
+b=tuple(int(x) for x in '$2'.lstrip('v').split('.')[:3])
+print('$1' if a>=b else '$2')
+"
+}
+
+file_sha256() {
+  if command -v sha256sum &>/dev/null; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# Resolve latest pnpm 9.x, fall back to installed version
+resolve_pnpm_version() {
+  local ver
+  if command -v npm &>/dev/null; then
+    ver=$(npm view pnpm@9 version 2>/dev/null | tail -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') || true
+  fi
+  if [[ -z "${ver:-}" ]]; then ver=$(pnpm --version); fi
+  echo "$ver"
+}
+
+# Fetch .nvmrc content from a GitHub repo via gh API, print Node version or ""
+fetch_nvmrc_version() {
+  local repo="$1"
+  local raw
+  raw=$(gh api "repos/$repo/contents/.nvmrc" --jq '.content' 2>/dev/null) || { echo ""; return; }
+  echo "$raw" | base64 --decode 2>/dev/null | tr -d '[:space:]' | sed 's/^v//'
+}
+
+# Fetch .tool-versions from a GitHub repo via gh API, print "tool version" lines or ""
+fetch_repo_tool_versions() {
+  local repo="$1"
+  local raw
+  raw=$(gh api "repos/$repo/contents/.tool-versions" --jq '.content' 2>/dev/null) || { echo ""; return; }
+  echo "$raw" | base64 --decode 2>/dev/null | grep -v '^#' | grep -v '^[[:space:]]*$'
+}
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+preflight() {
+  log_step "Preflight checks"
+
+  require_cmd git    "Install from https://git-scm.com"
+  require_cmd gh     "Install from https://cli.github.com"
+  require_cmd python3
+  require_cmd pnpm   "Install from https://pnpm.io"
+
+  local git_ver; git_ver=$(git --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  version_gte "$git_ver" "2.38.0" || die "git >= 2.38 required (found $git_ver)"
+  log_ok "git $git_ver"
+
+  local pnpm_ver; pnpm_ver=$(pnpm --version)
+  version_gte "$pnpm_ver" "9.0.0" || die "pnpm >= 9 required (found $pnpm_ver)"
+  log_ok "pnpm $pnpm_ver"
+
+  # git-filter-repo: vendored preferred, PATH fallback
+  if [[ -f "$VENDOR_FILTER_REPO" ]]; then
+    FILTER_REPO_CMD=("python3" "$VENDOR_FILTER_REPO")
+    log_ok "git-filter-repo: vendored (v$(python3 "$VENDOR_FILTER_REPO" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo '?'))"
+  elif command -v git-filter-repo &>/dev/null; then
+    FILTER_REPO_CMD=("git-filter-repo")
+    log_warn "git-filter-repo: system copy (consider vendoring at scripts/vendor/git-filter-repo)"
+  else
+    die "git-filter-repo not found. Vendor it at scripts/vendor/git-filter-repo or: pip install git-filter-repo"
+  fi
+
+  if [[ "$OPT_ASDF" == true ]]; then
+    require_cmd asdf "Install from https://asdf-vm.com"
+    log_ok "asdf: $(asdf version 2>/dev/null | head -1)"
+  else
+    require_cmd node "Install from https://nodejs.org"
+    local node_ver; node_ver=$(node --version | sed 's/^v//')
+    log_ok "node $node_ver (system)"
+  fi
+
+  log_info "Validating repository access..."
+  for repo in "${REPOS[@]}"; do
+    gh repo view "$repo" --json name &>/dev/null || die "Cannot access repository: $repo"
+    log_ok "  $repo"
+  done
+}
+
+# ── Bootstrap monorepo ────────────────────────────────────────────────────────
+bootstrap_monorepo() {
+  local monorepo="$1" scope="$2" pnpm_ver="$3" node_ver="${4:-}" tool_versions_content="${5:-}"
+
+  log_step "Bootstrapping monorepo at $monorepo"
+
+  if [[ "$OPT_DRY_RUN" == false ]]; then
+    mkdir -p "$monorepo"
+    git -C "$monorepo" init -b main 2>/dev/null || git -C "$monorepo" init
+
+    # pnpm-workspace.yaml
+    cat > "$monorepo/pnpm-workspace.yaml" <<'YAML'
+packages:
+  - 'apps/*'
+  - 'packages/*'
+YAML
+
+    # Root package.json
+    local engine_node="${node_ver:-$(node --version | sed 's/^v//')}"
+    python3 - "$monorepo/package.json" "$scope" "$engine_node" "$pnpm_ver" <<'PY'
+import json, sys
+path, scope, node_ver, pnpm_ver = sys.argv[1:]
+pkg = {
+    "name": f"{scope}/monorepo",
+    "private": True,
+    "scripts": {
+        "build": "pnpm -r build",
+        "lint":  "pnpm -r lint:check",
+        "test":  "pnpm -r test"
+    },
+    "engines": {
+        "node": f">={node_ver}",
+        "pnpm": f">={pnpm_ver}"
+    }
+}
+with open(path, "w") as f:
+    json.dump(pkg, f, indent=2); f.write("\n")
+PY
+
+    # .npmrc
+    cat > "$monorepo/.npmrc" <<'NPMRC'
+engine-strict=true
+//registry.npmjs.org/:_authToken=${NPM_TOKEN}
+NPMRC
+
+    # .gitignore
+    cat > "$monorepo/.gitignore" <<'GITIGNORE'
+node_modules/
+.env
+.env.local
+.env.*.local
+*.log
+dist/
+build/
+.DS_Store
+GITIGNORE
+
+    # .tool-versions (asdf only)
+    if [[ "$OPT_ASDF" == true ]]; then
+      if [[ -n "$tool_versions_content" ]]; then
+        printf '%s\n' "$tool_versions_content" > "$monorepo/.tool-versions"
+        log_ok "wrote .tool-versions"
+      elif [[ -n "$node_ver" ]]; then
+        printf 'nodejs %s\npnpm   %s\n' "$node_ver" "$pnpm_ver" > "$monorepo/.tool-versions"
+        log_ok "wrote .tool-versions (nodejs $node_ver, pnpm $pnpm_ver)"
+      fi
+      (cd "$monorepo" && asdf install)
+    fi
+
+    git -C "$monorepo" add -A
+    git -C "$monorepo" commit -m "chore: initialize pnpm monorepo"
+    log_ok "Monorepo initialized"
+  else
+    log_dry "mkdir -p $monorepo && git init && write pnpm-workspace.yaml package.json .npmrc .gitignore"
+    [[ "$OPT_ASDF" == true ]] && log_dry "write .tool-versions (all collected tools) && asdf install"
+    log_dry "git commit 'chore: initialize pnpm monorepo'"
+  fi
+}
+
+# ── migrate_packagejson ───────────────────────────────────────────────────────
+migrate_packagejson() {
+  local pkg_json="$1" scope="$2" dir_name="$3" pnpm_ver="$4"
+  [[ -f "$pkg_json" ]] || return 0
+  python3 - "$pkg_json" "$scope" "$dir_name" "$pnpm_ver" <<'PY'
+import json, sys
+path, scope, name, pnpm_ver = sys.argv[1:]
+with open(path) as f:
+    pkg = json.load(f)
+pkg["name"] = f"{scope}/{name}"
+pkg["packageManager"] = f"pnpm@{pnpm_ver}"
+with open(path, "w") as f:
+    json.dump(pkg, f, indent=2); f.write("\n")
+PY
+}
+
+# ── resolve_workspace_refs ────────────────────────────────────────────────────
+# After all imports, set workspace:* only for deps that actually exist in the
+# monorepo workspace (avoids clobbering company-wide npm packages).
+resolve_workspace_refs() {
+  local monorepo="$1"
+  log_step "Resolving workspace references"
+
+  if [[ "$OPT_DRY_RUN" == true ]]; then
+    log_dry "scan workspace packages and update workspace:* refs"
+    return 0
+  fi
+
+  python3 - "$monorepo" <<'PY'
+import json, sys, pathlib
+
+monorepo = pathlib.Path(sys.argv[1])
+workspace_pkgs = set()
+for base in ("apps", "packages"):
+    base_dir = monorepo / base
+    if not base_dir.is_dir():
+        continue
+    for pj in base_dir.glob("*/package.json"):
+        try:
+            name = json.loads(pj.read_text()).get("name", "")
+            if name:
+                workspace_pkgs.add(name)
+        except Exception:
+            pass
+
+if not workspace_pkgs:
+    sys.exit(0)
+
+updated = 0
+for base in ("apps", "packages"):
+    base_dir = monorepo / base
+    if not base_dir.is_dir():
+        continue
+    for pj in base_dir.glob("*/package.json"):
+        try:
+            pkg = json.loads(pj.read_text())
+        except Exception:
+            continue
+        changed = False
+        for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+            for dep in list(pkg.get(section, {})):
+                if dep in workspace_pkgs and pkg[section][dep] != "workspace:*":
+                    pkg[section][dep] = "workspace:*"
+                    changed = True
+        if changed:
+            pj.write_text(json.dumps(pkg, indent=2) + "\n")
+            updated += 1
+
+print(f"Updated workspace refs in {updated} package(s)")
+PY
+
+  git -C "$monorepo" add -A
+  local staged; staged=$(git -C "$monorepo" diff --cached --name-only 2>/dev/null || true)
+  if [[ -n "$staged" ]]; then
+    git -C "$monorepo" commit -m "chore: resolve workspace package references"
+    log_ok "Workspace references resolved"
+  else
+    log_info "No workspace refs needed updating"
+  fi
+}
+
+# ── migrate_nvmrc_to_tool_versions ────────────────────────────────────────────
+migrate_nvmrc_to_tool_versions() {
+  local monorepo="$1" pkg_dir="$2"
+  local nvmrc="$pkg_dir/.nvmrc"
+  local tool_versions="$monorepo/.tool-versions"
+  [[ -f "$nvmrc" && -f "$tool_versions" ]] || return 0
+
+  local new_ver; new_ver=$(cat "$nvmrc" | tr -d '[:space:]' | sed 's/^v//')
+  local cur_ver; cur_ver=$(grep '^nodejs ' "$tool_versions" | awk '{print $2}')
+  [[ -z "$new_ver" || -z "$cur_ver" ]] && return 0
+
+  if python3 -c "
+a=tuple(int(x) for x in '$new_ver'.split('.')[:3])
+b=tuple(int(x) for x in '$cur_ver'.split('.')[:3])
+exit(0 if a>b else 1)
+" 2>/dev/null; then
+    log_info "Upgrading .tool-versions nodejs $cur_ver → $new_ver"
+    sed -i.bak "s/^nodejs .*/nodejs $new_ver/" "$tool_versions" && rm -f "$tool_versions.bak"
+    (cd "$monorepo" && asdf install)
+    git -C "$monorepo" add .tool-versions
+  fi
+}
+
+# ── import_repo ───────────────────────────────────────────────────────────────
+import_repo() {
+  local repo="$1" monorepo="$2" target_dir="$3" scope="$4" pnpm_ver="$5"
+
+  local dir_name branch
+  dir_name="${OPT_NAME:-$(repo_name "$repo")}"
+  if [[ -n "$OPT_BRANCH" ]]; then
+    branch="$OPT_BRANCH"
+  else
+    branch=$(gh repo view "$repo" --json defaultBranchRef --jq '.defaultBranchRef.name')
+  fi
+
+  local dest="$monorepo/$target_dir/$dir_name"
+
+  # Idempotency check
+  if [[ -d "$dest" ]]; then
+    log_warn "$target_dir/$dir_name already present — skipping $repo"
+    return 0
+  fi
+
+  log_step "Importing $repo  →  $target_dir/$dir_name"
+
+  local tmp; tmp=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+
+  # 4. Clone
+  log_info "Cloning $repo..."
+  run gh repo clone "$repo" "$tmp/src" -- --no-local --quiet
+
+  # 5. Rewrite history under subdirectory
+  log_info "Rewriting history under $target_dir/$dir_name/..."
+  run "${FILTER_REPO_CMD[@]}" \
+    --source "$tmp/src" \
+    --target "$tmp/src" \
+    --to-subdirectory-filter "$target_dir/$dir_name/" \
+    --force
+
+  # 6. Rename tags → <dir_name>/<tag>
+  if [[ "$OPT_DRY_RUN" == false ]]; then
+    local tags; tags=$(git -C "$tmp/src" tag -l 2>/dev/null || true)
+    if [[ -n "$tags" ]]; then
+      while IFS= read -r tag; do
+        if git -C "$tmp/src" tag "$dir_name/$tag" "$tag" 2>/dev/null; then
+          git -C "$tmp/src" tag -d "$tag" &>/dev/null
+        else
+          log_warn "Tag collision: $dir_name/$tag — skipping rename of $tag"
+        fi
+      done <<< "$tags"
+    fi
+  else
+    log_dry "rename tags in $tmp/src with prefix $dir_name/"
+  fi
+
+  # 7. Merge into monorepo
+  log_info "Merging into monorepo..."
+  run git -C "$monorepo" remote add "import-$dir_name" "$tmp/src"
+  run git -C "$monorepo" fetch "import-$dir_name" --tags --quiet
+
+  if [[ "$OPT_DRY_RUN" == false ]]; then
+    if ! git -C "$monorepo" merge \
+        --allow-unrelated-histories --no-edit \
+        -m "chore: import $repo history into $target_dir/$dir_name" \
+        "import-$dir_name/$branch"; then
+      git -C "$monorepo" merge --abort 2>/dev/null || true
+      git -C "$monorepo" remote remove "import-$dir_name" 2>/dev/null || true
+      die "Merge conflict importing $repo. Resolve manually and re-run."
+    fi
+  else
+    log_dry "git merge --allow-unrelated-histories import-$dir_name/$branch"
+  fi
+
+  run git -C "$monorepo" remote remove "import-$dir_name"
+
+  # 8. Post-import fixups
+  if [[ "$OPT_DRY_RUN" == false ]]; then
+    # Remove yarn.lock
+    if [[ -f "$dest/yarn.lock" ]]; then
+      git -C "$monorepo" rm --cached "$target_dir/$dir_name/yarn.lock" --quiet 2>/dev/null || true
+      rm -f "$dest/yarn.lock"
+      log_info "Removed yarn.lock"
+    fi
+
+    # Migrate package.json
+    migrate_packagejson "$dest/package.json" "$scope" "$dir_name" "$pnpm_ver"
+    log_info "Migrated package.json  (name → $scope/$dir_name, packageManager → pnpm@$pnpm_ver)"
+
+    # .nvmrc → .tool-versions (asdf only)
+    [[ "$OPT_ASDF" == true ]] && migrate_nvmrc_to_tool_versions "$monorepo" "$dest"
+
+    # Remove per-package .npmrc if its content is a subset of root's
+    local pkg_npmrc="$dest/.npmrc" root_npmrc="$monorepo/.npmrc"
+    if [[ -f "$pkg_npmrc" && -f "$root_npmrc" ]]; then
+      local is_subset=true
+      while IFS= read -r line; do
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+        grep -qxF "$line" "$root_npmrc" 2>/dev/null || { is_subset=false; break; }
+      done < "$pkg_npmrc"
+      if [[ "$is_subset" == true ]]; then
+        git -C "$monorepo" rm --cached "$target_dir/$dir_name/.npmrc" --quiet 2>/dev/null || true
+        rm -f "$pkg_npmrc"
+        log_info "Removed redundant $target_dir/$dir_name/.npmrc"
+      fi
+    fi
+
+    git -C "$monorepo" add -A
+    local staged; staged=$(git -C "$monorepo" diff --cached --name-only 2>/dev/null || true)
+    [[ -n "$staged" ]] && git -C "$monorepo" commit -m "chore($dir_name): post-import cleanup"
+  else
+    log_dry "post-import fixups: migrate package.json, remove yarn.lock"
+    [[ "$OPT_ASDF" == true ]] && log_dry "migrate_nvmrc_to_tool_versions"
+  fi
+
+  IMPORTED_DIRS+=("$dest")
+  log_ok "Imported $repo  →  $target_dir/$dir_name"
+}
+
+# ── Shared config detection ───────────────────────────────────────────────────
+declare -A _CONFIG_TARGETS=(
+  ["tsconfig.json"]="tsconfig"
+  [".prettierrc"]="prettier-config"
+  [".prettierrc.json"]="prettier-config"
+  [".prettierrc.js"]="prettier-config"
+  [".prettierrc.yaml"]="prettier-config"
+  [".prettierrc.yml"]="prettier-config"
+  ["prettier.config.js"]="prettier-config"
+  ["prettier.config.mjs"]="prettier-config"
+  ["prettier.config.cjs"]="prettier-config"
+  ["eslint.config.js"]="eslint-config"
+  ["eslint.config.mjs"]="eslint-config"
+  ["eslint.config.cjs"]="eslint-config"
+  [".eslintrc"]="eslint-config"
+  [".eslintrc.js"]="eslint-config"
+  [".eslintrc.json"]="eslint-config"
+  [".eslintrc.yaml"]="eslint-config"
+  [".eslintrc.yml"]="eslint-config"
+)
+
+detect_shared_configs() {
+  local monorepo="$1"; shift
+  local dirs=("$@")
+  (( ${#dirs[@]} >= 2 )) || return 0
+
+  log_step "Shared config analysis"
+
+  local found_any=false
+  for config_file in "${!_CONFIG_TARGETS[@]}"; do
+    local hashes=() first_path=""
+    for dir in "${dirs[@]}"; do
+      local f="$dir/$config_file"
+      [[ -f "$f" ]] || continue
+      hashes+=("$(file_sha256 "$f")")
+      [[ -z "$first_path" ]] && first_path="$f"
+    done
+    (( ${#hashes[@]} < 2 )) && continue   # present in fewer than 2 packages
+
+    found_any=true
+    local unique; unique=$(printf '%s\n' "${hashes[@]}" | sort -u | wc -l | tr -d ' ')
+    if (( unique == 1 )); then
+      printf "  ${GREEN}✓${RESET} %-38s identical across %d/%d packages  → extractable\n" \
+        "$config_file" "${#hashes[@]}" "${#dirs[@]}"
+      EXTRACTABLE_CONFIGS["$config_file"]="$first_path"
+    else
+      printf "  ${YELLOW}⚠${RESET} %-38s differs between packages      → manual review\n" \
+        "$config_file"
+    fi
+  done
+  if [[ "$found_any" == false ]]; then
+    log_info "No shared config files found across imported packages."
+  fi
+}
+
+# ── Shared config extraction ──────────────────────────────────────────────────
+extract_shared_configs() {
+  local monorepo="$1" scope="$2"; shift 2
+  local dirs=("$@")
+  (( ${#EXTRACTABLE_CONFIGS[@]} )) || { log_info "Nothing to extract."; return 0; }
+
+  log_step "Extracting shared configs"
+
+  for config_file in "${!EXTRACTABLE_CONFIGS[@]}"; do
+    local target_pkg="${_CONFIG_TARGETS[$config_file]}"
+    local pkg_dir="$monorepo/packages/$target_pkg"
+    local source_file="${EXTRACTABLE_CONFIGS[$config_file]}"
+
+    # Create shared package skeleton once
+    if [[ ! -d "$pkg_dir" ]]; then
+      mkdir -p "$pkg_dir"
+      python3 - "$pkg_dir/package.json" "$scope" "$target_pkg" <<'PY'
+import json, sys
+path, scope, name = sys.argv[1:]
+with open(path, "w") as f:
+    json.dump({"name": f"{scope}/{name}", "version": "0.0.0", "private": True}, f, indent=2)
+    f.write("\n")
+PY
+      log_ok "Created $scope/$target_pkg"
+    fi
+
+    case "$target_pkg" in
+      tsconfig)
+        cp "$source_file" "$pkg_dir/base.json"
+        log_info "tsconfig.json → packages/tsconfig/base.json"
+        for dir in "${dirs[@]}"; do
+          [[ -f "$dir/tsconfig.json" ]] || continue
+          python3 - "$dir/tsconfig.json" "$scope" <<'PY'
+import json, sys
+path, scope = sys.argv[1:]
+with open(path) as f:
+    orig = json.load(f)
+out = {k: v for k, v in orig.items() if k != "compilerOptions"}
+out["extends"] = f"{scope}/tsconfig/base"
+with open(path, "w") as f:
+    json.dump(out, f, indent=2); f.write("\n")
+PY
+          python3 - "$dir/package.json" "$scope" <<'PY'
+import json, sys
+path, scope = sys.argv[1:]
+with open(path) as f:
+    pkg = json.load(f)
+pkg.setdefault("devDependencies", {})[f"{scope}/tsconfig"] = "workspace:*"
+with open(path, "w") as f:
+    json.dump(pkg, f, indent=2); f.write("\n")
+PY
+        done
+        ;;
+
+      prettier-config)
+        cp "$source_file" "$pkg_dir/index.json"
+        log_info "$(basename "$source_file") → packages/prettier-config/index.json"
+        for dir in "${dirs[@]}"; do
+          for pf in .prettierrc .prettierrc.json .prettierrc.js .prettierrc.yaml .prettierrc.yml \
+                     prettier.config.js prettier.config.mjs prettier.config.cjs; do
+            [[ -f "$dir/$pf" ]] || continue
+            rm "$dir/$pf"
+            python3 - "$dir/package.json" "$scope" <<'PY'
+import json, sys
+path, scope = sys.argv[1:]
+with open(path) as f:
+    pkg = json.load(f)
+pkg["prettier"] = f"{scope}/prettier-config"
+pkg.setdefault("devDependencies", {})[f"{scope}/prettier-config"] = "workspace:*"
+with open(path, "w") as f:
+    json.dump(pkg, f, indent=2); f.write("\n")
+PY
+            break
+          done
+        done
+        ;;
+
+      eslint-config)
+        local out_name; out_name="$(basename "$source_file")"
+        cp "$source_file" "$pkg_dir/$out_name"
+        log_info "$out_name → packages/eslint-config/$out_name"
+        for dir in "${dirs[@]}"; do
+          for ef in eslint.config.js eslint.config.mjs eslint.config.cjs \
+                     .eslintrc .eslintrc.js .eslintrc.json .eslintrc.yaml .eslintrc.yml; do
+            [[ -f "$dir/$ef" ]] || continue
+            if [[ "$ef" == eslint.config.* ]]; then
+              printf "import config from '%s/eslint-config';\nexport default config;\n" \
+                "$scope" > "$dir/$ef"
+            else
+              python3 -c "
+import json
+with open('$dir/$ef', 'w') as f:
+    json.dump({'extends': ['$scope/eslint-config']}, f, indent=2); f.write('\n')
+"
+            fi
+            python3 - "$dir/package.json" "$scope" <<'PY'
+import json, sys
+path, scope = sys.argv[1:]
+with open(path) as f:
+    pkg = json.load(f)
+pkg.setdefault("devDependencies", {})[f"{scope}/eslint-config"] = "workspace:*"
+with open(path, "w") as f:
+    json.dump(pkg, f, indent=2); f.write("\n")
+PY
+            break
+          done
+        done
+        ;;
+    esac
+  done
+
+  git -C "$monorepo" add -A
+  local staged; staged=$(git -C "$monorepo" diff --cached --name-only 2>/dev/null || true)
+  if [[ -n "$staged" ]]; then
+    git -C "$monorepo" commit -m "chore: extract shared configs into packages/"
+    log_ok "Committed shared config extraction"
+  fi
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+main() {
+  parse_args "$@"
+  preflight
+
+  # Resolve absolute monorepo path
+  local monorepo
+  monorepo="$(mkdir -p "$(dirname "$OPT_MONOREPO")" 2>/dev/null; \
+              cd "$(dirname "$OPT_MONOREPO")" && pwd)/$(basename "$OPT_MONOREPO")"
+
+  local target_dir
+  [[ "$OPT_PKG" == true ]] && target_dir="$OPT_PKG_DIR" || target_dir="$OPT_APP_DIR"
+
+  local scope; scope=$(derive_scope "${REPOS[0]}")
+  log_info "Scope: $scope  |  target: $target_dir/"
+
+  # Resolve pnpm version to pin
+  log_info "Resolving pnpm version to pin..."
+  local pnpm_ver; pnpm_ver=$(resolve_pnpm_version)
+  log_ok "pnpm pin: $pnpm_ver"
+
+  # Resolve tool versions (--asdf: scan .tool-versions and .nvmrc across repos)
+  local node_ver="" tool_versions_content=""
+  if [[ "$OPT_ASDF" == true ]]; then
+    log_info "Fetching tool versions from repos..."
+    declare -A _tv=()
+    _tv["pnpm"]="$pnpm_ver"
+    for repo in "${REPOS[@]}"; do
+      # Prefer .tool-versions over .nvmrc
+      local tv; tv=$(fetch_repo_tool_versions "$repo")
+      if [[ -n "$tv" ]]; then
+        log_info "  $repo → .tool-versions found"
+        while IFS= read -r line; do
+          local t v
+          t=$(awk '{print $1}' <<< "$line")
+          v=$(awk '{print $2}' <<< "$line")
+          [[ -z "$t" || -z "$v" ]] && continue
+          if [[ -n "${_tv[$t]:-}" ]]; then
+            _tv[$t]=$(max_version "${_tv[$t]}" "$v")
+          else
+            _tv[$t]="$v"
+          fi
+        done <<< "$tv"
+      fi
+      # Also check .nvmrc for nodejs
+      local nv; nv=$(fetch_nvmrc_version "$repo")
+      if [[ -n "$nv" ]]; then
+        log_info "  $repo → .nvmrc nodejs $nv"
+        if [[ -n "${_tv[nodejs]:-}" ]]; then
+          _tv[nodejs]=$(max_version "${_tv[nodejs]}" "$nv")
+        else
+          _tv[nodejs]="$nv"
+        fi
+      fi
+    done
+    # Ensure nodejs is set
+    if [[ -z "${_tv[nodejs]:-}" ]]; then
+      _tv[nodejs]=$(node --version 2>/dev/null | sed 's/^v//' || echo "22.0.0")
+      log_warn "No nodejs version found in repos; defaulting to ${_tv[nodejs]}"
+    fi
+    # Ensure pnpm is set (already set above, but always override with resolved ver)
+    _tv["pnpm"]="$pnpm_ver"
+    node_ver="${_tv[nodejs]}"
+    # Build .tool-versions content (nodejs first, then pnpm, then rest alphabetically)
+    local _content=""
+    _content+="nodejs ${_tv[nodejs]}"$'\n'
+    _content+="pnpm   ${_tv[pnpm]}"$'\n'
+    for t in $(printf '%s\n' "${!_tv[@]}" | sort); do
+      [[ "$t" == "nodejs" || "$t" == "pnpm" ]] && continue
+      _content+="$t ${_tv[$t]}"$'\n'
+    done
+    tool_versions_content="${_content%$'\n'}"  # trim trailing newline
+    log_ok "Tool versions: $(printf '%s\n' "${!_tv[@]}" | sort | while read -r t; do printf '%s=%s ' "$t" "${_tv[$t]}"; done)"
+  fi
+
+  # 1. Bootstrap or validate existing monorepo
+  if [[ ! -d "$monorepo/.git" ]]; then
+    bootstrap_monorepo "$monorepo" "$scope" "$pnpm_ver" "$node_ver" "$tool_versions_content"
+  else
+    [[ -f "$monorepo/pnpm-workspace.yaml" ]] || \
+      die "$monorepo is a git repo but has no pnpm-workspace.yaml"
+    log_ok "Using existing monorepo at $monorepo"
+
+    # Existing monorepo + --asdf: write .tool-versions if missing
+    if [[ "$OPT_ASDF" == true ]]; then
+      if [[ ! -f "$monorepo/.tool-versions" ]]; then
+        if [[ -n "$tool_versions_content" ]]; then
+          run bash -c "printf '%s\n' '$tool_versions_content' > '$monorepo/.tool-versions'"
+        else
+          run bash -c "printf 'nodejs %s\npnpm   %s\n' '$node_ver' '$pnpm_ver' > '$monorepo/.tool-versions'"
+        fi
+        run git -C "$monorepo" add .tool-versions
+        run git -C "$monorepo" commit -m "chore: add .tool-versions"
+      fi
+    fi
+  fi
+
+  # 2–9. Import each repo
+  for repo in "${REPOS[@]}"; do
+    import_repo "$repo" "$monorepo" "$target_dir" "$scope" "$pnpm_ver"
+  done
+
+  # 10. Resolve workspace cross-references (workspace:* only for actual workspace pkgs)
+  if [[ ${#IMPORTED_DIRS[@]} -gt 0 ]]; then
+    resolve_workspace_refs "$monorepo"
+  fi
+
+  # 11. pnpm install
+  if [[ "$OPT_NO_INSTALL" == false && ${#IMPORTED_DIRS[@]} -gt 0 ]]; then
+    log_step "Running pnpm install"
+    if [[ "$OPT_ASDF" == true ]]; then
+      run bash -c "cd '$monorepo' && asdf install"
+    fi
+    if [[ "$OPT_DRY_RUN" == false ]]; then
+      if (cd "$monorepo" && pnpm install); then
+        git -C "$monorepo" add pnpm-lock.yaml 2>/dev/null || true
+        local staged; staged=$(git -C "$monorepo" diff --cached --name-only 2>/dev/null || true)
+        [[ -n "$staged" ]] && git -C "$monorepo" commit -m "chore: add pnpm-lock.yaml"
+        log_ok "pnpm install complete"
+      else
+        log_warn "pnpm install failed — fix issues and re-run: pnpm install in $monorepo"
+      fi
+    else
+      log_dry "cd $monorepo && pnpm install"
+    fi
+  fi
+
+  # 12. Shared config analysis (always) + optional extraction
+  if (( ${#IMPORTED_DIRS[@]} >= 2 )); then
+    detect_shared_configs "$monorepo" "${IMPORTED_DIRS[@]}"
+    if [[ "$OPT_EXTRACT_CONFIGS" == true ]]; then
+      [[ "$OPT_DRY_RUN" == false ]] && \
+        extract_shared_configs "$monorepo" "$scope" "${IMPORTED_DIRS[@]}"
+      [[ "$OPT_DRY_RUN" == true ]] && log_dry "extract shared configs"
+    elif (( ${#EXTRACTABLE_CONFIGS[@]} > 0 )); then
+      log_info "Re-run with --extract-configs to extract identical configs into shared packages/."
+    fi
+  fi
+
+  log_step "Done"
+  log_ok "Monorepo ready at $monorepo"
+}
+
+main "$@"
