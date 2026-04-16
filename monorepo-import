@@ -136,10 +136,15 @@ file_sha256() {
 resolve_pnpm_version() {
   local ver
   if command -v npm &>/dev/null; then
-    ver=$(npm view pnpm@9 version 2>/dev/null | tail -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') || true
+    # grep -oE can emit multiple lines if the input has multiple version-like tokens;
+    # tail -1 ensures we keep only the last (highest) match.
+    ver=$(npm view pnpm@9 version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | tail -1) || true
   fi
-  if [[ -z "${ver:-}" ]]; then ver=$(pnpm --version); fi
-  echo "$ver"
+  if [[ -z "${ver:-}" ]]; then
+    ver=$(pnpm --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
+  fi
+  # Paranoid: strip any embedded newlines so the caller always gets a single token.
+  echo "${ver%%$'\n'*}"
 }
 
 # Fetch .nvmrc content from a GitHub repo via gh API, print Node version or ""
@@ -362,6 +367,65 @@ PY
   fi
 }
 
+# ── fix_phantom_deps ──────────────────────────────────────────────────────────
+# Detect imports of @scope/* packages that are missing from package.json (phantom
+# dependencies — worked under npm/yarn hoisting but break under pnpm strict mode).
+# Adds them as direct dependencies using the version from the npm registry.
+fix_phantom_deps() {
+  local pkg_dir="$1" scope="$2"
+  local pkg_json="$pkg_dir/package.json"
+  [[ -f "$pkg_json" ]] || return 0
+
+  python3 - "$pkg_dir" "$scope" "$pkg_json" <<'PY'
+import json, re, sys, pathlib, subprocess
+
+pkg_dir  = pathlib.Path(sys.argv[1])
+scope    = sys.argv[2]
+pkg_json = pathlib.Path(sys.argv[3])
+
+import_re = re.compile(r"""['"](@[a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+)['"]""")
+
+imported = set()
+for ext in ("*.ts", "*.js", "*.tsx", "*.jsx"):
+    for f in pkg_dir.rglob(ext):
+        if "node_modules" in f.parts:
+            continue
+        try:
+            for m in import_re.finditer(f.read_text(errors="replace")):
+                imported.add(m.group(1))
+        except Exception:
+            pass
+
+with open(pkg_json) as fh:
+    pkg = json.load(fh)
+
+declared = set()
+for s in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+    declared.update(pkg.get(s, {}).keys())
+
+missing = sorted(d for d in imported if d.startswith(scope + "/") and d not in declared)
+if not missing:
+    sys.exit(0)
+
+added = {}
+for dep in missing:
+    try:
+        r = subprocess.run(["npm", "view", dep, "version"],
+                           capture_output=True, text=True, timeout=15)
+        ver = re.search(r"[0-9]+\.[0-9]+\.[0-9]+", r.stdout)
+        added[dep] = f"^{ver.group(0)}" if ver else "*"
+    except Exception:
+        added[dep] = "*"
+
+pkg.setdefault("dependencies", {}).update(added)
+with open(pkg_json, "w") as fh:
+    json.dump(pkg, fh, indent=2); fh.write("\n")
+
+for dep, ver in added.items():
+    print(f"phantom dep detected and added: {dep}@{ver}")
+PY
+}
+
 # ── migrate_nvmrc_to_tool_versions ────────────────────────────────────────────
 migrate_nvmrc_to_tool_versions() {
   local monorepo="$1" pkg_dir="$2"
@@ -472,6 +536,9 @@ import_repo() {
     migrate_packagejson "$dest/package.json" "$scope" "$dir_name" "$pnpm_ver"
     log_info "Migrated package.json  (name → $scope/$dir_name, packageManager → pnpm@$pnpm_ver)"
 
+    # Detect and add phantom deps (imports of @scope/* not in package.json)
+    fix_phantom_deps "$dest" "$scope"
+
     # .nvmrc → .tool-versions (asdf only)
     [[ "$OPT_ASDF" == true ]] && migrate_nvmrc_to_tool_versions "$monorepo" "$dest"
 
@@ -494,7 +561,7 @@ import_repo() {
     local staged; staged=$(git -C "$monorepo" diff --cached --name-only 2>/dev/null || true)
     [[ -n "$staged" ]] && git -C "$monorepo" commit -m "chore($dir_name): post-import cleanup"
   else
-    log_dry "post-import fixups: migrate package.json, remove yarn.lock"
+    log_dry "post-import fixups: migrate package.json, remove yarn.lock, fix phantom deps"
     [[ "$OPT_ASDF" == true ]] && log_dry "migrate_nvmrc_to_tool_versions"
   fi
 
