@@ -269,6 +269,7 @@ monorepo-import():
 
 ### `migrate_packagejson()` detail
 
+- Rewrite `"name"` to `@translated/<repo-name>` (e.g. `@translated/tos-connector-notification-service`)
 - Set `"packageManager": "pnpm@<version>"` (matching `.tool-versions` when `--asdf` is used, otherwise the version resolved via `npm view pnpm dist-tags`)
 - Remove the `"packageManager": "yarn@..."` entry
 - If the package has internal `@translated/*` dependencies that exist in this monorepo, replace their version specifiers with `"workspace:*"`
@@ -398,7 +399,7 @@ Each imported package keeps its own `Dockerfile` and `deploy.sh` unchanged. Team
 
 ## Open questions
 
-1. **Package naming convention** — Should the workspace `name` in `package.json` remain the original (`tos-connector-notification-service`) or be scoped (`@translated/tos-connector-notification-service`)? Scoping makes internal `workspace:*` references unambiguous.
+1. ~~**Package naming convention**~~ — **Resolved: scoped.** The `name` field in each package's `package.json` is rewritten to `@translated/<repo-name>` (e.g. `@translated/tos-connector-notification-service`). Scoped names make `workspace:*` references unambiguous, prevent accidental resolution against the public npm registry, and are consistent with the shared config packages created by `--extract-configs`.
 
 2. ~~**`apps/` vs `packages/` split`**~~ — **Resolved: Turborepo-style.** Deployable applications (both frontends and backend services) live under `apps/`; shared internal libraries and configs live under `packages/`. The script defaults to `apps/`; pass `--pkg` to target `packages/` instead.
 
