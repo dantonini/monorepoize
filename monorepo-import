@@ -291,12 +291,15 @@ migrate_packagejson() {
   local pkg_json="$1" scope="$2" dir_name="$3" pnpm_ver="$4"
   [[ -f "$pkg_json" ]] || return 0
   python3 - "$pkg_json" "$scope" "$dir_name" "$pnpm_ver" <<'PY'
-import json, sys
+import json, re, sys
 path, scope, name, pnpm_ver = sys.argv[1:]
 with open(path) as f:
     pkg = json.load(f)
 pkg["name"] = f"{scope}/{name}"
 pkg["packageManager"] = f"pnpm@{pnpm_ver}"
+# Rewrite yarn → pnpm in all script values so lifecycle hooks work under pnpm.
+for key, val in list(pkg.get("scripts", {}).items()):
+    pkg["scripts"][key] = re.sub(r'\byarn\b', 'pnpm', val)
 with open(path, "w") as f:
     json.dump(pkg, f, indent=2); f.write("\n")
 PY
@@ -780,6 +783,7 @@ main() {
           t=$(awk '{print $1}' <<< "$line")
           v=$(awk '{print $2}' <<< "$line")
           [[ -z "$t" || -z "$v" ]] && continue
+          [[ "$t" == "yarn" ]] && continue  # migrating to pnpm; drop yarn
           if [[ -n "${_tv[$t]:-}" ]]; then
             _tv[$t]=$(max_version "${_tv[$t]}" "$v")
           else
