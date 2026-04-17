@@ -30,6 +30,14 @@ OPT_NO_PRE_TEST=false
 OPT_NO_POST_TEST=false
 REPOS=()
 IMPORTED_DIRS=()
+OPT_NO_PRE_AUDIT=false
+OPT_NO_POST_AUDIT=false
+OPT_AUDIT_STRICT=false
+declare -A _PRE_CLONE_DIR=()
+declare -A _PRE_CLONE_PM=()
+declare -A _AUDIT_BASELINES=()
+declare -a _AUDIT_CI_NOTES=()
+_MONOREPO_PRE_BASELINE="[]"
 declare -A EXTRACTABLE_CONFIGS=()
 
 # ── Colour logging ────────────────────────────────────────────────────────────
@@ -74,6 +82,10 @@ Options:
   --no-test            Skip both pre-import and post-import test phases.
   --no-pre-test        Skip running the source repo's tests before importing.
   --no-post-test       Skip running imported packages' tests inside the monorepo.
+  --no-audit           Skip both pre-import and post-import audit phases.
+  --no-pre-audit       Skip running the source repo's vulnerability audit before importing.
+  --no-post-audit      Skip running pnpm audit in the monorepo after importing.
+  --audit-strict       Treat pre-import audit failures as fatal (default: warn only).
   --help
 EOF
 }
@@ -96,6 +108,10 @@ parse_args() {
       --no-test)         OPT_NO_PRE_TEST=true; OPT_NO_POST_TEST=true;     shift   ;;
       --no-pre-test)     OPT_NO_PRE_TEST=true;                            shift   ;;
       --no-post-test)    OPT_NO_POST_TEST=true;                           shift   ;;
+      --no-audit)        OPT_NO_PRE_AUDIT=true; OPT_NO_POST_AUDIT=true;  shift   ;;
+      --no-pre-audit)    OPT_NO_PRE_AUDIT=true;                           shift   ;;
+      --no-post-audit)   OPT_NO_POST_AUDIT=true;                          shift   ;;
+      --audit-strict)    OPT_AUDIT_STRICT=true;                           shift   ;;
       --help|-h)         usage; exit 0 ;;
       --*)               die "Unknown option: $1" ;;
       *)                 REPOS+=("$1");             shift   ;;
@@ -619,38 +635,27 @@ except Exception:
 PY
 }
 
-run_pre_import_tests() {
+# Clone and install a source repo into a temp dir shared by test and audit phases.
+# Idempotent: no-op if the clone already exists for this repo.
+# Sets _PRE_CLONE_DIR["$repo"] and _PRE_CLONE_PM["$repo"].
+make_pre_import_clone() {
   local repo="$1"
   local dir_name="${OPT_NAME:-$(repo_name "$repo")}"
 
-  if [[ "$OPT_DRY_RUN" == true ]]; then
-    log_dry "pre-import test: clone $repo, install, run test suite"
-    return 0
-  fi
-
-  log_step "Pre-import test: $dir_name"
+  [[ -n "${_PRE_CLONE_DIR[$repo]:-}" ]] && return 0
 
   local tmp; tmp=$(mktemp -d)
-  # shellcheck disable=SC2064
-  trap "rm -rf '$tmp'" RETURN
+  _PRE_CLONE_DIR["$repo"]="$tmp"
 
-  log_info "Cloning $repo for pre-import test..."
+  log_info "Cloning $repo for pre-import phase..."
   gh repo clone "$repo" "$tmp/src" -- --no-local --quiet
 
-  if ! has_test_script "$tmp/src/package.json"; then
-    log_warn "$dir_name: no runnable test script — skipping pre-import test"
-    return 0
-  fi
-
-  # Install tools declared in .tool-versions (covers nodejs, pnpm, etc.)
   if command -v asdf &>/dev/null && [[ -f "$tmp/src/.tool-versions" ]]; then
     (cd "$tmp/src" && asdf install)
   fi
 
   local pm; pm=$(detect_pm "$tmp/src")
 
-  # If the detected package manager isn't usable (e.g. asdf shim active but no
-  # version set because the repo's .tool-versions doesn't list it):
   if ! (cd "$tmp/src" && "$pm" --version) &>/dev/null 2>&1; then
     if [[ "$OPT_ASDF" == true ]]; then
       local pm_ver
@@ -667,7 +672,6 @@ run_pre_import_tests() {
   fi
 
   log_info "Installing dependencies with $pm..."
-
   case "$pm" in
     pnpm) (cd "$tmp/src" && pnpm install --frozen-lockfile) ;;
     yarn)
@@ -687,11 +691,43 @@ run_pre_import_tests() {
       ;;
   esac || die "$dir_name: pre-import dependency install failed"
 
+  _PRE_CLONE_PM["$repo"]="$pm"
+}
+
+cleanup_pre_import_clone() {
+  local repo="$1"
+  if [[ -n "${_PRE_CLONE_DIR[$repo]:-}" ]]; then
+    rm -rf "${_PRE_CLONE_DIR[$repo]}"
+    unset '_PRE_CLONE_DIR[$repo]'
+    unset '_PRE_CLONE_PM[$repo]'
+  fi
+}
+
+run_pre_import_tests() {
+  local repo="$1"
+  local dir_name="${OPT_NAME:-$(repo_name "$repo")}"
+
+  if [[ "$OPT_DRY_RUN" == true ]]; then
+    log_dry "pre-import test: clone $repo, install, run test suite"
+    return 0
+  fi
+
+  log_step "Pre-import test: $dir_name"
+
+  make_pre_import_clone "$repo"
+  local src="${_PRE_CLONE_DIR[$repo]}/src"
+
+  if ! has_test_script "$src/package.json"; then
+    log_warn "$dir_name: no runnable test script — skipping pre-import test"
+    return 0
+  fi
+
+  local pm="${_PRE_CLONE_PM[$repo]}"
   log_info "Running tests..."
   case "$pm" in
-    pnpm) (cd "$tmp/src" && pnpm test) ;;
-    yarn) (cd "$tmp/src" && yarn test) ;;
-    npm)  (cd "$tmp/src" && npm test)  ;;
+    pnpm) (cd "$src" && pnpm test) ;;
+    yarn) (cd "$src" && yarn test) ;;
+    npm)  (cd "$src" && npm test)  ;;
   esac || die "$dir_name: pre-import tests FAILED — fix the source repo before migrating"
 
   log_ok "$dir_name: pre-import tests passed"
@@ -731,6 +767,285 @@ run_post_import_tests() {
       die "$dir_name: post-import tests FAILED — monorepo is intact; fix then re-run: pnpm --filter '$pkg_name' test"
 
     log_ok "$dir_name: post-import tests passed"
+  done
+}
+
+# ── Security audit ───────────────────────────────────────────────────────────
+
+readonly -a _AUDIT_EXCEPTION_FILES=(
+  .auditignore
+  audit-exceptions.json
+  .nsprc
+  .auditrc
+  audit.json
+  .audit-ci.json
+  audit-ci.json
+)
+
+# Parse HIGH/CRITICAL findings from audit --json output.
+# $1: package manager (yarn|pnpm|npm)  $2: file containing raw audit output
+# stdout: JSON array of "pkg:version_range:severity" strings
+_parse_audit_findings() {
+  local pm="$1" file="$2"
+  python3 - "$pm" "$file" <<'PY'
+import json, sys
+pm   = sys.argv[1]
+file = sys.argv[2]
+try:
+    text = open(file).read().strip()
+except Exception:
+    text = ""
+findings = set()
+if pm == "yarn":
+    for line in text.splitlines():
+        try:
+            obj = json.loads(line)
+            if obj.get("type") == "auditAdvisory":
+                adv = obj["data"]["advisory"]
+                sev = adv.get("severity", "")
+                if sev in ("high", "critical"):
+                    pkg = adv.get("module_name", "")
+                    via = adv.get("vulnerable_versions", "*")
+                    if pkg: findings.add(f"{pkg}:{via}:{sev}")
+        except Exception: pass
+elif pm in ("pnpm", "npm"):
+    try:
+        data = json.loads(text)
+        # npm/pnpm v2 audit format
+        if "vulnerabilities" in data:
+            for pkg, info in data["vulnerabilities"].items():
+                sev = info.get("severity", "")
+                if sev in ("high", "critical"):
+                    via = info.get("range", "*")
+                    findings.add(f"{pkg}:{via}:{sev}")
+        # pnpm older advisories format
+        elif "advisories" in data:
+            advs = data["advisories"]
+            items = advs.values() if isinstance(advs, dict) else advs
+            for adv in items:
+                sev = adv.get("severity", "")
+                if sev in ("high", "critical"):
+                    pkg = adv.get("module_name", "")
+                    via = adv.get("vulnerable_versions", "*")
+                    if pkg: findings.add(f"{pkg}:{via}:{sev}")
+    except Exception: pass
+print(json.dumps(sorted(findings)))
+PY
+}
+
+# Compute the union of all collected pre-import baselines into one JSON array.
+_union_audit_baselines() {
+  local tmp; tmp=$(mktemp)
+  local repo
+  for repo in "${!_AUDIT_BASELINES[@]}"; do
+    printf '%s\n' "${_AUDIT_BASELINES[$repo]}" >> "$tmp"
+  done
+  python3 - "$tmp" <<'PY'
+import json, sys
+findings = set()
+for line in open(sys.argv[1]).read().strip().splitlines():
+    line = line.strip()
+    if line:
+        try: findings.update(json.loads(line))
+        except Exception: pass
+print(json.dumps(sorted(findings)))
+PY
+  rm -f "$tmp"
+}
+
+# Pretty-print a JSON array of HIGH/CRITICAL finding strings.
+_print_audit_findings() {
+  local findings_json="$1"
+  python3 - "$findings_json" <<'PY'
+import json, sys
+RED="\033[0;31m"; YELLOW="\033[0;33m"; RST="\033[0m"
+findings = json.loads(sys.argv[1])
+if not findings:
+    print("  (none)")
+    sys.exit(0)
+for f in findings:
+    parts = f.split(":", 2)
+    pkg  = parts[0]
+    via  = parts[1] if len(parts) > 1 else "*"
+    sev  = parts[2] if len(parts) > 2 else "?"
+    col  = RED if sev == "critical" else YELLOW
+    print(f"  {col}{sev.upper()}{RST}  {pkg}  ({via})")
+PY
+}
+
+# Scan source repo for audit commands in CI/pipeline files and for accepted-
+# vulnerability suppression files. Results are accumulated in _AUDIT_CI_NOTES.
+detect_audit_ci_commands() {
+  local repo="$1" src="$2"
+  local dir_name="${OPT_NAME:-$(repo_name "$repo")}"
+
+  local matches
+  matches=$(grep -rn --exclude-dir=node_modules \
+    --include="*.yml" --include="*.yaml" \
+    --include="Dockerfile" --include="Dockerfile.*" \
+    --include="Makefile" --include="GNUmakefile" \
+    --include="*.sh" \
+    -E "(yarn|pnpm|npm) audit" "$src" 2>/dev/null || true)
+
+  local pkg_matches=""
+  if [[ -f "$src/package.json" ]]; then
+    pkg_matches=$(python3 - "$src/package.json" <<'PY'
+import json, re, sys
+try:
+    scripts = json.load(open(sys.argv[1])).get("scripts", {})
+    for k, v in scripts.items():
+        if re.search(r'(yarn|pnpm|npm)\s+audit', str(v or "")):
+            print(f"  package.json (scripts.{k}): {v}")
+except Exception: pass
+PY
+)
+  fi
+
+  local exception_files=()
+  for f in "${_AUDIT_EXCEPTION_FILES[@]}"; do
+    [[ -f "$src/$f" ]] && exception_files+=("$f")
+  done
+
+  [[ -z "$matches" && -z "$pkg_matches" && ${#exception_files[@]} -eq 0 ]] && return 0
+
+  local note="[audit-migrate] $dir_name:"
+
+  if [[ -n "$matches" || -n "$pkg_matches" ]]; then
+    note+=$'\n'"  Audit commands found (files NOT modified — update manually):"
+    local line
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && note+=$'\n'"    $line"
+    done <<< "$matches"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && note+=$'\n'"    $line"
+    done <<< "$pkg_matches"
+    note+=$'\n'"  → Equivalent pnpm command: pnpm audit --audit-level high --prod"
+  fi
+
+  for f in "${exception_files[@]}"; do
+    note+=$'\n'"  [warn] Accepted-vulnerability file: $f — not applied; review manually"
+  done
+
+  _AUDIT_CI_NOTES+=("$note")
+}
+
+run_pre_import_audit() {
+  local repo="$1"
+  local dir_name="${OPT_NAME:-$(repo_name "$repo")}"
+
+  if [[ "$OPT_DRY_RUN" == true ]]; then
+    log_dry "pre-import audit: $repo — run audit --json, detect CI commands"
+    return 0
+  fi
+
+  log_step "Pre-import audit: $dir_name"
+
+  make_pre_import_clone "$repo"
+  local src="${_PRE_CLONE_DIR[$repo]}/src"
+  local pm="${_PRE_CLONE_PM[$repo]}"
+
+  detect_audit_ci_commands "$repo" "$src"
+
+  if [[ "$pm" == "yarn" ]]; then
+    local yarn_ver; yarn_ver=$(cd "$src" && yarn --version 2>/dev/null || echo "0")
+    if ! version_gte "$yarn_ver" "1.22"; then
+      log_warn "$dir_name: yarn $yarn_ver < 1.22 — --json output unreliable; skipping pre-import audit"
+      _AUDIT_BASELINES["$repo"]="[]"
+      return 0
+    fi
+  fi
+
+  local audit_cmd
+  case "$pm" in
+    yarn) audit_cmd="yarn audit --level high --groups dependencies --json" ;;
+    pnpm) audit_cmd="pnpm audit --audit-level high --prod --json" ;;
+    npm)  audit_cmd="npm audit --audit-level high --omit=dev --json" ;;
+  esac
+
+  log_info "$dir_name: running $audit_cmd..."
+  local audit_file findings
+  audit_file=$(mktemp)
+  (cd "$src" && eval "$audit_cmd" 2>/dev/null || true) > "$audit_file"
+  findings=$(_parse_audit_findings "$pm" "$audit_file")
+  rm -f "$audit_file"
+  _AUDIT_BASELINES["$repo"]="$findings"
+
+  local count; count=$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$findings")
+
+  if (( count > 0 )); then
+    if [[ "$OPT_AUDIT_STRICT" == true ]]; then
+      log_warn "$dir_name: pre-import audit — $count HIGH/CRITICAL vulnerability(s):"
+      _print_audit_findings "$findings"
+      die "$dir_name: pre-import audit failed (--audit-strict)"
+    else
+      log_warn "$dir_name: pre-import audit — $count HIGH/CRITICAL vulnerability(s) (pre-existing):"
+      _print_audit_findings "$findings"
+    fi
+  else
+    log_ok "$dir_name: pre-import audit — no HIGH/CRITICAL vulnerabilities"
+  fi
+}
+
+run_post_import_audit() {
+  local monorepo="$1"; shift
+  local dirs=("$@")
+
+  if [[ "$OPT_DRY_RUN" == true ]]; then
+    log_dry "post-import audit: pnpm audit --audit-level high --prod --json"
+    return 0
+  fi
+
+  log_step "Post-import audit"
+
+  # Build combined baseline: union of all pre-import repo baselines + monorepo
+  # pre-existing state (to avoid false positives on incremental imports).
+  local pre_import_union; pre_import_union=$(_union_audit_baselines)
+  local combined_baseline
+  combined_baseline=$(python3 - "$pre_import_union" "$_MONOREPO_PRE_BASELINE" <<'PY'
+import json, sys
+a = set(json.loads(sys.argv[1]))
+b = set(json.loads(sys.argv[2]))
+print(json.dumps(sorted(a | b)))
+PY
+)
+
+  log_info "Running pnpm audit --audit-level high --prod..."
+  local audit_file findings
+  audit_file=$(mktemp)
+  (cd "$monorepo" && pnpm audit --audit-level high --prod --json 2>/dev/null || true) > "$audit_file"
+  findings=$(_parse_audit_findings "pnpm" "$audit_file")
+  rm -f "$audit_file"
+
+  local new_findings
+  new_findings=$(python3 - "$findings" "$combined_baseline" <<'PY'
+import json, sys
+current  = set(json.loads(sys.argv[1]))
+baseline = set(json.loads(sys.argv[2]))
+print(json.dumps(sorted(current - baseline)))
+PY
+)
+
+  local new_count total_count
+  new_count=$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$new_findings")
+  total_count=$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$findings")
+
+  if (( new_count > 0 )); then
+    log_warn "Post-import audit — $new_count NEW HIGH/CRITICAL vulnerability(s) introduced by migration:"
+    _print_audit_findings "$new_findings"
+    die "post-import audit FAILED — migration introduced new HIGH/CRITICAL vulnerabilities; monorepo git state is intact"
+  elif (( total_count > 0 )); then
+    log_warn "Post-import audit — $total_count pre-existing HIGH/CRITICAL vulnerability(s) carried over from source repo(s)"
+  else
+    log_ok "Post-import audit — no HIGH/CRITICAL vulnerabilities"
+  fi
+}
+
+print_audit_summary() {
+  (( ${#_AUDIT_CI_NOTES[@]} )) || return 0
+  printf "\n${BOLD}==> Audit migration notes${RESET}\n"
+  local note
+  for note in "${_AUDIT_CI_NOTES[@]}"; do
+    printf "${YELLOW}%s${RESET}\n\n" "$note"
   done
 }
 
@@ -1060,9 +1375,22 @@ main() {
     fi
   fi
 
+  # Capture pre-existing monorepo audit baseline (incremental-import guard).
+  # Only relevant when the monorepo already has installed packages.
+  if [[ "$OPT_NO_POST_AUDIT" == false && "$OPT_NO_INSTALL" == false && \
+        -f "$monorepo/pnpm-lock.yaml" ]]; then
+    log_info "Capturing pre-existing monorepo audit baseline..."
+    local _mrepo_audit_file; _mrepo_audit_file=$(mktemp)
+    (cd "$monorepo" && pnpm audit --audit-level high --prod --json 2>/dev/null || true) > "$_mrepo_audit_file"
+    _MONOREPO_PRE_BASELINE=$(_parse_audit_findings "pnpm" "$_mrepo_audit_file")
+    rm -f "$_mrepo_audit_file"
+  fi
+
   # 2–9. Import each repo
   for repo in "${REPOS[@]}"; do
-    [[ "$OPT_NO_PRE_TEST" == false ]] && run_pre_import_tests "$repo"
+    [[ "$OPT_NO_PRE_TEST"  == false ]] && run_pre_import_tests  "$repo"
+    [[ "$OPT_NO_PRE_AUDIT" == false ]] && run_pre_import_audit  "$repo"
+    cleanup_pre_import_clone "$repo"
     import_repo "$repo" "$monorepo" "$target_dir" "$scope" "$pnpm_ver"
   done
 
@@ -1101,6 +1429,15 @@ main() {
     run_post_import_tests "$monorepo" "${IMPORTED_DIRS[@]}"
   fi
 
+  # 13.5. Post-import audit
+  if [[ "$OPT_NO_POST_AUDIT" == false && ${#IMPORTED_DIRS[@]} -gt 0 ]]; then
+    if [[ "$OPT_NO_INSTALL" == true ]]; then
+      log_warn "post-import audit skipped — --no-install: no installed node_modules to audit"
+    else
+      run_post_import_audit "$monorepo" "${IMPORTED_DIRS[@]}"
+    fi
+  fi
+
   # 14. Shared config analysis (always) + optional extraction
   if (( ${#IMPORTED_DIRS[@]} >= 2 )); then
     detect_shared_configs "$monorepo" "${IMPORTED_DIRS[@]}"
@@ -1112,6 +1449,8 @@ main() {
       log_info "Re-run with --extract-configs to extract identical configs into shared packages/."
     fi
   fi
+
+  print_audit_summary
 
   log_step "Done"
   log_ok "Monorepo ready at $monorepo"
