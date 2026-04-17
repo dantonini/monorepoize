@@ -26,6 +26,8 @@ OPT_ASDF=false
 OPT_EXTRACT_CONFIGS=false
 OPT_DRY_RUN=false
 OPT_NO_INSTALL=false
+OPT_NO_PRE_TEST=false
+OPT_NO_POST_TEST=false
 REPOS=()
 IMPORTED_DIRS=()
 declare -A EXTRACTABLE_CONFIGS=()
@@ -69,6 +71,9 @@ Options:
   --extract-configs    Extract identical configs into shared packages/.
   --dry-run            Print actions without executing.
   --no-install         Skip pnpm install.
+  --no-test            Skip both pre-import and post-import test phases.
+  --no-pre-test        Skip running the source repo's tests before importing.
+  --no-post-test       Skip running imported packages' tests inside the monorepo.
   --help
 EOF
 }
@@ -85,9 +90,12 @@ parse_args() {
       --name)            OPT_NAME="$2";            shift 2 ;;
       --branch)          OPT_BRANCH="$2";          shift 2 ;;
       --asdf)            OPT_ASDF=true;            shift   ;;
-      --extract-configs) OPT_EXTRACT_CONFIGS=true; shift   ;;
-      --dry-run)         OPT_DRY_RUN=true;         shift   ;;
-      --no-install)      OPT_NO_INSTALL=true;      shift   ;;
+      --extract-configs) OPT_EXTRACT_CONFIGS=true;                         shift   ;;
+      --dry-run)         OPT_DRY_RUN=true;                                shift   ;;
+      --no-install)      OPT_NO_INSTALL=true;                             shift   ;;
+      --no-test)         OPT_NO_PRE_TEST=true; OPT_NO_POST_TEST=true;     shift   ;;
+      --no-pre-test)     OPT_NO_PRE_TEST=true;                            shift   ;;
+      --no-post-test)    OPT_NO_POST_TEST=true;                           shift   ;;
       --help|-h)         usage; exit 0 ;;
       --*)               die "Unknown option: $1" ;;
       *)                 REPOS+=("$1");             shift   ;;
@@ -528,13 +536,6 @@ import_repo() {
 
   # 8. Post-import fixups
   if [[ "$OPT_DRY_RUN" == false ]]; then
-    # Remove yarn.lock
-    if [[ -f "$dest/yarn.lock" ]]; then
-      git -C "$monorepo" rm --cached "$target_dir/$dir_name/yarn.lock" --quiet 2>/dev/null || true
-      rm -f "$dest/yarn.lock"
-      log_info "Removed yarn.lock"
-    fi
-
     # Migrate package.json
     migrate_packagejson "$dest/package.json" "$scope" "$dir_name" "$pnpm_ver"
     log_info "Migrated package.json  (name → $scope/$dir_name, packageManager → pnpm@$pnpm_ver)"
@@ -564,12 +565,173 @@ import_repo() {
     local staged; staged=$(git -C "$monorepo" diff --cached --name-only 2>/dev/null || true)
     [[ -n "$staged" ]] && git -C "$monorepo" commit -m "chore($dir_name): post-import cleanup"
   else
-    log_dry "post-import fixups: migrate package.json, remove yarn.lock, fix phantom deps"
+    log_dry "post-import fixups: migrate package.json, fix phantom deps"
     [[ "$OPT_ASDF" == true ]] && log_dry "migrate_nvmrc_to_tool_versions"
   fi
 
   IMPORTED_DIRS+=("$dest")
   log_ok "Imported $repo  →  $target_dir/$dir_name"
+}
+
+# ── Test validation ───────────────────────────────────────────────────────────
+# Resolve a tool version from .tool-versions, package.json#packageManager, or
+# asdf latest. Used when the asdf shim is active but the version is unset.
+resolve_tool_version() {
+  local dir="$1" tool="$2"
+  local ver
+  if [[ -f "$dir/.tool-versions" ]]; then
+    ver=$(awk -v t="$tool" '$1==t {print $2; exit}' "$dir/.tool-versions")
+    [[ -n "$ver" ]] && { echo "$ver"; return; }
+  fi
+  if [[ -f "$dir/package.json" ]]; then
+    ver=$(python3 -c "
+import json, re, sys
+try:
+    m = re.match(r'[^@]+@([^+\s]+)', json.load(open(sys.argv[1])).get('packageManager','') or '')
+    if m: print(m.group(1))
+except: pass
+" "$dir/package.json" 2>/dev/null || true)
+    [[ -n "$ver" ]] && { echo "$ver"; return; }
+  fi
+  ver=$(asdf latest "$tool" 2>/dev/null || true)
+  echo "${ver:-}"
+}
+
+detect_pm() {
+  local dir="$1"
+  if   [[ -f "$dir/pnpm-lock.yaml" ]]; then echo "pnpm"
+  elif [[ -f "$dir/yarn.lock"      ]]; then echo "yarn"
+  else                                       echo "npm"
+  fi
+}
+
+# Return 0 if package.json at $1 has a non-placeholder test script
+has_test_script() {
+  local pkg_json="$1"
+  [[ -f "$pkg_json" ]] || return 1
+  python3 - "$pkg_json" <<'PY'
+import json, sys
+try:
+    t = json.load(open(sys.argv[1])).get("scripts", {}).get("test", "")
+    sys.exit(0 if t and t != 'echo "Error: no test specified"' else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+run_pre_import_tests() {
+  local repo="$1"
+  local dir_name="${OPT_NAME:-$(repo_name "$repo")}"
+
+  if [[ "$OPT_DRY_RUN" == true ]]; then
+    log_dry "pre-import test: clone $repo, install, run test suite"
+    return 0
+  fi
+
+  log_step "Pre-import test: $dir_name"
+
+  local tmp; tmp=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+
+  log_info "Cloning $repo for pre-import test..."
+  gh repo clone "$repo" "$tmp/src" -- --no-local --quiet
+
+  if ! has_test_script "$tmp/src/package.json"; then
+    log_warn "$dir_name: no runnable test script — skipping pre-import test"
+    return 0
+  fi
+
+  # Install tools declared in .tool-versions (covers nodejs, pnpm, etc.)
+  if command -v asdf &>/dev/null && [[ -f "$tmp/src/.tool-versions" ]]; then
+    (cd "$tmp/src" && asdf install)
+  fi
+
+  local pm; pm=$(detect_pm "$tmp/src")
+
+  # If the detected package manager isn't usable (e.g. asdf shim active but no
+  # version set because the repo's .tool-versions doesn't list it):
+  if ! (cd "$tmp/src" && "$pm" --version) &>/dev/null 2>&1; then
+    if [[ "$OPT_ASDF" == true ]]; then
+      local pm_ver
+      pm_ver=$(resolve_tool_version "$tmp/src" "$pm")
+      [[ -z "$pm_ver" ]] && die "$dir_name: $pm not available and no version found to install via asdf"
+      log_info "$dir_name: $pm version not set — installing $pm $pm_ver via asdf..."
+      asdf plugin add "$pm" 2>/dev/null || true
+      asdf install "$pm" "$pm_ver" || die "$dir_name: asdf install $pm $pm_ver failed"
+      export "ASDF_${pm^^}_VERSION=$pm_ver"
+    else
+      log_warn "$dir_name: $pm not available, falling back to npm"
+      pm="npm"
+    fi
+  fi
+
+  log_info "Installing dependencies with $pm..."
+
+  case "$pm" in
+    pnpm) (cd "$tmp/src" && pnpm install --frozen-lockfile) ;;
+    yarn)
+      local major; major=$(cd "$tmp/src" && yarn --version 2>/dev/null | grep -oE '^[0-9]+' || echo "1")
+      if (( major >= 2 )); then
+        (cd "$tmp/src" && yarn install --immutable)
+      else
+        (cd "$tmp/src" && yarn install --frozen-lockfile)
+      fi
+      ;;
+    npm)
+      if [[ -f "$tmp/src/package-lock.json" ]]; then
+        (cd "$tmp/src" && npm ci)
+      else
+        (cd "$tmp/src" && npm install --legacy-peer-deps)
+      fi
+      ;;
+  esac || die "$dir_name: pre-import dependency install failed"
+
+  log_info "Running tests..."
+  case "$pm" in
+    pnpm) (cd "$tmp/src" && pnpm test) ;;
+    yarn) (cd "$tmp/src" && yarn test) ;;
+    npm)  (cd "$tmp/src" && npm test)  ;;
+  esac || die "$dir_name: pre-import tests FAILED — fix the source repo before migrating"
+
+  log_ok "$dir_name: pre-import tests passed"
+}
+
+run_post_import_tests() {
+  local monorepo="$1"; shift
+  local dirs=("$@")
+
+  if [[ "$OPT_DRY_RUN" == true ]]; then
+    log_dry "post-import tests: pnpm --filter <name> test for each imported package"
+    return 0
+  fi
+
+  log_step "Post-import tests"
+
+  for dest in "${dirs[@]}"; do
+    local dir_name; dir_name=$(basename "$dest")
+    local pkg_json="$dest/package.json"
+
+    if ! has_test_script "$pkg_json"; then
+      log_warn "$dir_name: no runnable test script — skipping post-import test"
+      continue
+    fi
+
+    local pkg_name
+    pkg_name=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('name',''))" "$pkg_json")
+
+    log_info "Testing $pkg_name..."
+
+    if [[ "$OPT_NO_INSTALL" == true ]]; then
+      (cd "$monorepo" && pnpm install --filter "$pkg_name") || \
+        die "$dir_name: pnpm install --filter failed before post-import test"
+    fi
+
+    (cd "$monorepo" && pnpm --filter "$pkg_name" test) || \
+      die "$dir_name: post-import tests FAILED — monorepo is intact; fix then re-run: pnpm --filter '$pkg_name' test"
+
+    log_ok "$dir_name: post-import tests passed"
+  done
 }
 
 # ── Shared config detection ───────────────────────────────────────────────────
@@ -746,6 +908,60 @@ PY
   fi
 }
 
+# ── convert_lockfile ─────────────────────────────────────────────────────────
+# Convert yarn.lock / package-lock.json from imported packages into a
+# workspace-level pnpm-lock.yaml via `pnpm import`, preserving exact pinned
+# versions. This must run BEFORE `pnpm install` so that install uses the
+# original version pins instead of resolving fresh from the registry.
+convert_lockfile() {
+  local monorepo="$1"; shift
+  local dirs=("$@")
+
+  if [[ "$OPT_DRY_RUN" == true ]]; then
+    log_dry "pnpm import: convert yarn.lock / package-lock.json to pnpm-lock.yaml"
+    return 0
+  fi
+
+  # Find the first imported package that carries a convertible lockfile.
+  # yarn.lock is preferred; package-lock.json is the fallback.
+  local lock_src=""
+  for dest in "${dirs[@]}"; do
+    if   [[ -f "$dest/yarn.lock"         ]]; then lock_src="$dest/yarn.lock";         break
+    elif [[ -f "$dest/package-lock.json" ]]; then lock_src="$dest/package-lock.json"; break
+    fi
+  done
+
+  if [[ -z "$lock_src" ]]; then
+    log_info "No yarn.lock / package-lock.json found — pnpm-lock.yaml will be generated fresh."
+    return 0
+  fi
+
+  local lock_name; lock_name=$(basename "$lock_src")
+  log_step "Converting $lock_name → pnpm-lock.yaml (pnpm import)"
+
+  # pnpm import reads the lockfile from the CWD (workspace root).
+  cp "$lock_src" "$monorepo/$lock_name"
+  (cd "$monorepo" && pnpm import) || die "pnpm import failed — could not convert $lock_name to pnpm-lock.yaml"
+  rm "$monorepo/$lock_name"
+  log_ok "pnpm-lock.yaml generated from $lock_name — dependency versions preserved"
+
+  # Remove source lockfiles from all imported packages and commit.
+  for dest in "${dirs[@]}"; do
+    for lf in yarn.lock package-lock.json; do
+      [[ -f "$dest/$lf" ]] || continue
+      local rel_path
+      rel_path=$(python3 -c "import os; print(os.path.relpath('$dest/$lf', '$monorepo'))")
+      git -C "$monorepo" rm --cached "$rel_path" --quiet 2>/dev/null || true
+      rm -f "$dest/$lf"
+      log_info "Removed $rel_path"
+    done
+  done
+
+  git -C "$monorepo" add -A
+  local staged; staged=$(git -C "$monorepo" diff --cached --name-only 2>/dev/null || true)
+  [[ -n "$staged" ]] && git -C "$monorepo" commit -m "chore: convert $lock_name to pnpm-lock.yaml"
+}
+
 # ── main ──────────────────────────────────────────────────────────────────────
 main() {
   parse_args "$@"
@@ -846,6 +1062,7 @@ main() {
 
   # 2–9. Import each repo
   for repo in "${REPOS[@]}"; do
+    [[ "$OPT_NO_PRE_TEST" == false ]] && run_pre_import_tests "$repo"
     import_repo "$repo" "$monorepo" "$target_dir" "$scope" "$pnpm_ver"
   done
 
@@ -854,7 +1071,12 @@ main() {
     resolve_workspace_refs "$monorepo"
   fi
 
-  # 11. pnpm install
+  # 11. Convert imported lockfiles → workspace pnpm-lock.yaml (preserves pinned versions)
+  if [[ ${#IMPORTED_DIRS[@]} -gt 0 ]]; then
+    convert_lockfile "$monorepo" "${IMPORTED_DIRS[@]}"
+  fi
+
+  # 12. pnpm install
   if [[ "$OPT_NO_INSTALL" == false && ${#IMPORTED_DIRS[@]} -gt 0 ]]; then
     log_step "Running pnpm install"
     if [[ "$OPT_ASDF" == true ]]; then
@@ -874,7 +1096,12 @@ main() {
     fi
   fi
 
-  # 12. Shared config analysis (always) + optional extraction
+  # 13. Post-import tests (after resolve_workspace_refs + pnpm install)
+  if [[ "$OPT_NO_POST_TEST" == false && ${#IMPORTED_DIRS[@]} -gt 0 ]]; then
+    run_post_import_tests "$monorepo" "${IMPORTED_DIRS[@]}"
+  fi
+
+  # 14. Shared config analysis (always) + optional extraction
   if (( ${#IMPORTED_DIRS[@]} >= 2 )); then
     detect_shared_configs "$monorepo" "${IMPORTED_DIRS[@]}"
     if [[ "$OPT_EXTRACT_CONFIGS" == true ]]; then
